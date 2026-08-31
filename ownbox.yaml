@@ -1,0 +1,26 @@
+schema: 1
+name: wd_gen
+description: Generate absurd, memorable passwords and usernames from a target profile
+homepage: https://github.com/BogdanStamenovic/wd_gen
+tags: [cli, password, username, wordlist, python]
+install:
+  platforms: [linux, darwin, windows]
+  setup:
+    linux:
+      - python -m venv .venv
+      - .venv/bin/python -m pip install -e .
+    darwin:
+      - python -m venv .venv
+      - .venv/bin/python -m pip install -e .
+    windows:
+      - python -m venv .venv
+      - '.venv\Scripts\python.exe -m pip install -e .'
+  update:
+    linux: [.venv/bin/python -m pip install -e .]
+    darwin: [.venv/bin/python -m pip install -e .]
+    windows: ['.venv\Scripts\python.exe -m pip install -e .']
+  remove: []
+command:
+  linux: .venv/bin/wd_gen
+  darwin: .venv/bin/wd_gen
+  windows: '.venv\Scripts\wd_gen.exe'
