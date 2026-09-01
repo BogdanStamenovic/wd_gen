@@ -1,75 +1,90 @@
 # wd_gen
 
-Targeted OSINT/CTF credential wordlist generator. Give it a person's name and
-whatever facts you have; it emits the *plausible* usernames and passwords that
-specific person would actually pick — ranked most-likely-first, so the best
-guesses are at the top of the file.
+Targeted OSINT/CTF credential wordlist generator with a small LLM as the
+**planner**. You describe the target and the situation in plain language; the LLM
+decides *how* the list should be built — which facts matter, which nickname
+stems to try, which mangling rules to run (and it can write new ones), how
+heavily to fold in generic common passwords — and a deterministic engine executes
+that plan. The model decides; the engine makes.
 
 This is the [CUPP](https://github.com/Mebus/cupp) +
-[username-anarchy](https://github.com/urbanadventurer/username-anarchy) lineage:
-credential *profiling*, not random tumbling. For a target named
-**Bogdan Stamenovix, born 2001, pet goose** it produces the systematic space a
-real person picks from —
+[username-anarchy](https://github.com/urbanadventurer/username-anarchy) lineage
+with an orchestration layer on top: credential *profiling*, not random tumbling.
 
 ```
-bogdans          bstamenovix      bogdan.stamenovix    bogdanstamenovix
-Bogdan2001       Bogdan123        Pigion2001           Bogdan230501   (DDMMYY)
-b0gdan           goosebogdan      Bogdan2001!          bstamen
+$ wd_gen
+purpose (what the credential is, e.g. 'office wifi password'):
+> instagram username
+context (who/where/facts; end with a blank line or Ctrl-D):
+> Target is Bogdan Stamenovic, goes by Bogi sometimes, born 2001.
+> I want his likely instagram handle.
+
+→ bogi, bogis, boba, bobas, bogdanstam, bogi2001, stamenovic01, b0gis, ...
 ```
 
-— plus the **generic common credentials** a person picks regardless of who they
-are (`admin123`, `password1`, `123456`, and for handles `admin`/`root`), blended
-in and ranked by how much they fit the context — plus, optionally, a small local
-LLM to cover the non-systematic handles a person invents (`bogdanthegeese2001`,
-`stam3novix2001`).
+The model reads that brief, extracts the fields, and invents the
+culturally-plausible stems an algorithm can't — *Bogdan → bogi, boki, boba,
+boda* — which the engine then blends with the surname (`boda` + **S**tamenovic →
+`bodas`). It also decided this is a *handle*, which is unique by nature, so it
+**suppressed** the generic `admin`/`root` class entirely. Point it at a WiFi key
+or an admin login instead and it does the opposite — defaults like `admin123`
+lead the list.
 
 > **Authorized use only.** This is a tool for CTF challenges, OSINT exercises,
 > and password audits you are permitted to run. It generates a wordlist and
 > writes it to stdout — it does no hashing, cracking, spraying, or network I/O
-> of any kind. What you point it at is your responsibility.
+> beyond talking to your own LLM server. What you point it at is your responsibility.
 
 ## How it works
 
-Two engines, picked by a flag:
+**The planner → executor split.** Every realistic run is driven by a *build
+plan*. The LLM planner produces it from your brief; when no LLM is reachable a
+regex classifier produces a heuristic one instead. Either way the executor gets
+the same structure and runs it deterministically (reproducible under `--seed`).
+See the plan for any run with `--show-plan`, save/edit/replay it with
+`--plan-only` / `--plan FILE`.
 
-**Realistic (default)** — enumerates the shapes people demonstrably choose from
-the target's own tokens:
+The plan decides:
 
-```
-usernames: first, last, first+last, f.last, first+lastinitial, initials,
-           truncations, nick, token+year, light leetspeak
-passwords: token + meaningful year/number (birthday expands to YYYY/YY/DDMM/
-           DDMMYYYY), + one symbol, name+name combos, Title/UPPER/leet casings
-```
+- **fields** — the name/pet/org/dates pulled out of your free-text context.
+- **fragments** — creative nickname stems the model invents (`bogi`, `boda`),
+  which the engine blends with the surname into handles (`bodas`, `bogistam`).
+- **themed_seeds** — "this list could be relevant too" material (a football
+  club, a city, a game).
+- **modules** — which engines run (usernames / passwords / common).
+- **rules** — mangling rules, chosen from the built-in set **and authored on the
+  spot**: `substitute` (leet maps), `affix` (prepend/append), `case`, and raw
+  `regex` (`{pattern, repl}`). Authored regex is compile-checked and sandboxed to
+  short tokens, so a bad rule can't crash or hang the run.
+- **common_weight** — how heavily to fold in the generic common credentials
+  (`admin123`, `password1`, `admin`/`root`) that a targeted list never covers on
+  its own. Its value is a judgement about the credential's *nature*:
 
-Ranked by a *plausibility* heuristic: the target's own name and **real** dates
-outrank generic years, plain handles stay near the top, symbol-soup sinks.
-
-**Common credentials, weighted by context** — a targeted list alone never
-contains `admin123`, but real people use it. So wd_gen also blends in a
-frequency-ranked list of the passwords/handles people pick *regardless of
-identity*. How high they rank — or whether they belong at all — is decided by
-**what the credential is for**, because that is in its nature:
-
-| Context (`--context`) | Common creds |
+| Context | Common creds |
 | --- | --- |
 | `office wifi` / `router admin login` | ranked **at the top** — defaults dominate here |
-| *(nothing / unknown)* | **interleaved** by real-world frequency |
+| a password, unknown service | **interleaved** by real-world frequency |
 | `instagram username` | **suppressed** — a handle is unique, a generic one is useless |
 
-The small LLM reads the free-text context and sets that weight; when it's absent
-a regex classifier does the same job (`wifi`/`admin`/`social`/`corporate`/
-`generic`). Force it yourself with `--common-weight` (`0` suppresses, `~1`
-interleaves, `~1.6` tops the list), or turn the whole class off with
-`--no-common`.
+The permutation engine underneath is comprehensive: first/last/f.last/initials,
+truncations, the fragment blender, birthday expansion (YYYY/YY/DDMM/DDMMYYYY),
+name+name combos, casings, light leet, policy shapes (`Word2024!`). Results are
+ranked most-likely-first by a plausibility heuristic — the target's own material
+and real dates outrank generic years; for usernames, everything is forced
+url-safe so a symbol rule can't leak an invalid handle.
 
-The LLM (`--llm`) talks to an **ollama server over HTTP** — by default
-`http://archserver:11434`, overridable with `--llm-host` or `$OLLAMA_HOST`, so no
-local model or `ollama` binary is needed. It's used for two things: setting the
-context/common-cred policy above, and generating the non-systematic creative
-handles. `--llm-backend claude` swaps in a keyless `claude -p` instead. Either
-way it's strictly additive: unreachable host, cold model, or timeout just drops
-the layer with a warning and the deterministic engine covers the run.
+**The LLM** (`--llm`, and on automatically for an interactive/`--context` run)
+talks to an **ollama server over HTTP** — default `http://archserver:11434`,
+overridable with `--llm-host` or `$OLLAMA_HOST`, so no local model or `ollama`
+binary is needed. `--llm-backend claude` swaps in a keyless `claude -p`. It is
+strictly best-effort: an unreachable host, a cold model, a timeout, or
+unparseable JSON (with one repair-and-retry) all fall back to the heuristic plan
+with a warning — a run never fails on the LLM.
+
+You can still skip the planner entirely and drive it with flags
+(`--owner`/`--birthday`/…); that path uses the heuristic plan. Force the common
+weight yourself with `--common-weight` (`0` suppresses, `~1` interleaves, `~1.6`
+tops the list) or kill the class with `--no-common`.
 
 **Chaos (`--chaos`)** — the absurd meme generator (themed word banks + rule
 mangling): `MoistHamsterOverlord69!`. Memorable, not realistic. It was the
@@ -98,48 +113,58 @@ wd_gen [options] > wordlist.txt
 
 | Option | Meaning |
 | --- | --- |
+| *(bare `wd_gen` on a TTY)* | prompts for **purpose** then **context** and lets the LLM plan |
+| `-i, --interactive` | force the interactive brief (even when flags are given) |
 | `-n, --count N` | how many candidates to emit (default 5000) |
 | `-u, --usernames` | generate handles instead of passwords |
 | `--chaos` | absurd meme mode instead of realistic OSINT |
 | `--profile FILE` | load a target profile (JSON or `field: a, b` lines) |
 | `--owner "First Last"` | target's full name (repeatable) |
 | `--nick` | known nickname/handle (repeatable) |
-| `--context TEXT` | what the credential is *for* (`office wifi`, `instagram login`) — drives the common-cred blend (repeatable; alias `--purpose`) |
+| `--purpose TEXT` | what the credential is (`office wifi password`, `instagram username`) |
+| `--context TEXT` | free-text brief for the planner — who/where/facts, like an email |
 | `--birthday D` | birthday/year — `2001` or `23/05/2001` (repeatable) |
 | `--org / --pet / --keyword / --extra` | employer, pet, city/hobby/job, partner… |
 | `--no-common` | don't blend in generic common credentials |
 | `--common-weight W` | force the common-cred weight: `0` suppress, `~1` interleave, `~1.6` top of list |
+| `--llm` | use the LLM planner (auto-on for an interactive or `--context` run) |
+| `--llm-host URL` | ollama server URL (default `$OLLAMA_HOST` or `http://archserver:11434`) |
+| `--llm-backend / --llm-model` | `ollama\|claude`, and the ollama model tag |
+| `--plan FILE` | run a saved plan JSON instead of asking the planner |
+| `--show-plan` | print the build plan to stderr before generating |
+| `--plan-only` | print the plan JSON to stdout and exit (no wordlist) |
 | `--years LO-HI` | year range appended to names (default 1970–2026) |
 | `--min-len / --max-len` | length window (default 3–48) |
 | `--seed N` | reproducible RNG |
-| `--llm` | also ask an LLM (`--llm-backend ollama\|claude`, `--llm-model`) |
-| `--llm-host URL` | ollama server URL (default `$OLLAMA_HOST` or `http://archserver:11434`) |
 | `--json` | emit `{value, score, source}` objects instead of plain lines |
 | `-v/-q` | verbose / quiet (both to stderr) |
 
-stdout carries only the wordlist (or the JSON array); progress, warnings and
-errors go to stderr. Exit codes: `0` ok, `1` failed, `2` usage error.
+stdout carries only the wordlist (or the JSON array); prompts, progress, warnings
+and errors go to stderr. Exit codes: `0` ok, `1` failed, `2` usage error.
 
 ### Examples
 
 ```sh
-# usernames for a target, birthday-aware ranking
-wd_gen -u --owner "Bogdan Stamenovix" --birthday 2001 --pet goose --seed 1
+# interactive: it asks for purpose, then a free-text context, then plans the build
+wd_gen > wordlist.txt
 
-# passwords, full date expands to DDMM / DDMMYY / DDMMYYYY tails
-wd_gen --owner "Bogdan Stamenovix" --birthday 23/05/2001 --org Acme -n 5000
+# same, non-interactively: purpose + an email-style brief, LLM plans it
+wd_gen --purpose "office wifi password" \
+       --context "Auditing the home router. Owner Bogdan Stamenovic, born 2001,
+                  pet goose Gilbert, big Liverpool fan. Need the WPA2 key." > wifi.txt
 
-# context decides the blend: a wifi key -> common creds rank at the top
-wd_gen --owner "Bogdan Stamenovix" --context "home wifi wpa2 key" -n 5000
+# see the plan the model produced, without generating a wordlist
+wd_gen --purpose "instagram username" --context "Bogdan, aka Bogi, born 2001" --plan-only
 
-# an admin login -> admin/root/default creds lead; --llm lets the model judge
-wd_gen -u --owner "Bogdan Stamenovix" --context "router admin login page" --llm
+# save a plan, tweak it, replay it deterministically
+wd_gen --purpose "..." --context "..." --plan-only > plan.json
+wd_gen --plan plan.json --seed 1 -n 5000 > wordlist.txt
 
-# an instagram handle is unique by nature -> generic handles suppressed
-wd_gen -u --owner "Bogdan Stamenovix" --context "instagram username"
+# no LLM / no brief: classic flag-driven run (heuristic plan)
+wd_gen -u --owner "Bogdan Stamenovic" --birthday 2001 --pet goose --seed 1
 
-# add local-LLM coverage for the creative handles, keep 8–16 char results
-wd_gen -u --profile target.profile --llm --min-len 8 --max-len 16
+# force the common-cred weight yourself, skip the planner's judgement
+wd_gen --owner "Bogdan Stamenovic" --common-weight 1.6 -n 5000
 
 # reproducible JSON with plausibility scores and provenance
 wd_gen --owner "Ada Lovelace" --birthday 1815 --seed 42 --json -n 100
@@ -167,14 +192,19 @@ keywords: pigion, belgrade
 ## Limitations
 
 - **It generates lines. That's all.** No hashing, cracking, credential testing,
-  or network I/O. Feed the output to a tool you're authorized to run.
+  or spraying; the only network I/O is talking to your own LLM server. Feed the
+  output to a tool you're authorized to run.
+- **The planner is only as good as the small model.** It decides fields,
+  fragments, rules and weights — an 8B model gets this mostly right but not
+  always (it may under- or over-weight the common class, or miss a nickname).
+  Use `--show-plan` to see the call and `--common-weight` / `--plan FILE` to
+  override it.
 - **Plausibility is a heuristic, not a guarantee.** It orders guesses by how
   commonly real people pick each shape — it can't know your specific target's
-  quirks. Truly random handles (`b0g13a`) are where the `--llm` layer helps and
-  even then it's guessing.
+  quirks.
 - **The LLM layer is best-effort.** If the ollama host is unreachable, the model
-  is cold, or it times out, wd_gen warns on stderr and the deterministic engine
-  covers the count on its own.
+  is cold, it times out, or its JSON won't parse (after one repair-and-retry),
+  wd_gen warns on stderr and the heuristic plan covers the run.
 - **Realistic mode is best with a target.** With an empty profile the targeted
   engine has nothing to build from, so you get only the generic common-credential
   list (a useful standalone wordlist, but not *targeted*) — add `--no-common` and

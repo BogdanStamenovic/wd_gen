@@ -23,8 +23,9 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from importlib.resources import files
 
-from . import absurd, context, perms
+from . import absurd, context, perms, planner, rules
 from .mangle import DEFAULT_RULES, mangle
+from .plan import BuildPlan
 from .profile import Profile
 
 DEFAULT_COUNT = 5000
@@ -50,7 +51,9 @@ class Config:
     year_range: tuple[int, int] = perms.DEFAULT_YEAR_RANGE
     # generic common-credential blending (realistic style)
     include_common: bool = True
-    common_weight: float | None = None  # None = let context/LLM decide; else force
+    common_weight: float | None = None  # None = let plan/context decide; else force
+    # the build plan (from the LLM planner or heuristic); None -> heuristic here
+    plan: BuildPlan | None = None
     # chaos-only knobs
     wordlist: list[str] = field(default_factory=list)
     rules: Sequence[str] = DEFAULT_RULES
@@ -131,10 +134,37 @@ def _generate_realistic(
     progress: Callable[[str], None],
     warn: Callable[[str], None],
 ) -> list[Candidate]:
-    is_username = config.mode == "usernames"
-    base_tokens = perms.personal_tokens(config.profile)
-    hot_numbers = frozenset(perms.expand_dates(config.profile))
-    progress(f"target tokens: {len(base_tokens)} -> {base_tokens[:8]}")
+    """Realistic (OSINT) generation, driven by a BuildPlan.
+
+    The plan says *how* to build: which fields/fragments/themes to use, which
+    engines and mangling rules to run, and how heavily to fold in generic common
+    creds. It comes from the LLM planner (via ``config.plan``) or, when absent, a
+    heuristic plan built here so a plain flag-driven run still works.
+    """
+    plan = config.plan or planner.heuristic_plan(config.profile, mode=config.mode)
+    return _execute_plan(plan, config, rng, progress, warn)
+
+
+def _execute_plan(
+    plan: BuildPlan,
+    config: Config,
+    rng: random.Random,
+    progress: Callable[[str], None],
+    warn: Callable[[str], None],
+) -> list[Candidate]:
+    profile = planner.merged_profile(config.profile, plan)
+    is_username = plan.mode == "usernames"
+    frag_themed = _clean_tokens(list(plan.fragments) + list(plan.themed_seeds))
+    # Fragments and themed seeds the planner chose count as "target material" for
+    # ranking, so their decorated forms get the same top-tier bonus as the name.
+    base_tokens = perms.personal_tokens(profile) + frag_themed
+    hot_numbers = frozenset(perms.expand_dates(profile))
+    numbers = perms.number_bank(profile, config.year_range)
+    last_tokens = perms.last_name_tokens(profile)
+    progress(
+        f"plan[{plan.source}] {plan.mode}: {len(plan.rules)} rules, "
+        f"{len(plan.fragments)} fragments, {len(plan.themed_seeds)} themes — {plan.notes}"
+    )
 
     pool: dict[str, Candidate] = {}
 
@@ -142,75 +172,110 @@ def _generate_realistic(
         value = value.strip()
         if not (config.min_len <= len(value) <= config.max_len):
             return
+        # Handles must stay url-safe; a symbol-adding rule can't leak into usernames.
+        if is_username and not _is_handle_safe(value):
+            return
         if score is None:
             score = perms.plausibility(value, base_tokens, hot_numbers)
-            if source == "llm":
-                score += 0.5  # the model saw the whole profile; nudge its picks up
         cur = pool.get(value)
         if cur is None or score > cur.score:
             pool[value] = Candidate(value=value, score=score, source=source)
 
-    if is_username:
-        for u in perms.iter_usernames(config.profile, year_range=config.year_range):
-            add(u, "perm")
-    else:
-        for p in perms.iter_passwords(config.profile, rng, year_range=config.year_range):
-            add(p, "perm")
-    progress(f"after permutations: {len(pool)}")
+    # 1. core permutation engine (+ the fragment blender for handles)
+    if plan.module(plan.mode).enabled:
+        if is_username:
+            for u in perms.iter_usernames(profile, year_range=config.year_range):
+                add(u, "perm")
+            for base in perms.fragment_bases(plan.fragments, last_tokens):
+                for form in perms.leet_variants(base):
+                    for v in perms.decorate_username(form, numbers):
+                        add(v, "frag")
+        else:
+            for p in perms.iter_passwords(profile, rng, year_range=config.year_range):
+                add(p, "perm")
+            for tok in frag_themed:
+                for form in [*perms.cap_variants(tok), *perms.leet_variants(tok)]:
+                    for v in perms.decorate_password(form, numbers):
+                        add(v, "frag")
+        progress(f"after permutations: {len(pool)}")
 
-    # Generic common credentials (admin123, password1, admin/root...) — the class
-    # a targeted profile never covers on its own. How heavily they blend in, and
-    # whether they belong at all, is decided by the context (LLM or regex).
-    if config.include_common:
-        policy = _resolve_policy(config, is_username, progress, warn)
+    # 2. mangling rules — named built-ins the planner selected + ones it authored
+    if plan.rules:
+        for word in _rule_bases(profile, plan, is_username, last_tokens):
+            for variant in rules.apply_rules(word, plan.rules, rng):
+                add(variant, "rule")
+        progress(f"after rules: {len(pool)}")
+
+    # 3. generic common credentials, at the plan's weight (CLI override wins)
+    common = plan.module("common")
+    if config.include_common and common.enabled:
+        weight = plan.common_weight if plan.common_weight is not None else common.weight
+        if config.common_weight is not None:
+            weight = config.common_weight
+        policy = context.ContextPolicy(category=plan.source, common_weight=max(0.0, weight))
         _inject_common(policy, is_username, config, add)
         progress(f"after common creds: {len(pool)}")
 
-    if config.use_llm:
-        _run_llm(config, pool, add, progress, warn)
-
     if not pool:
         warn(
-            "no candidates — give the target's name and facts "
-            "(--owner/--nick/--keyword/--birthday ...); realistic mode needs a target"
+            "no candidates — give a name/facts (--owner/--birthday/...) or an "
+            "interactive brief; realistic mode needs a target"
         )
 
     ranked = sorted(pool.values(), key=lambda c: (-c.score, _tiebreak(c.value)))
     if len(ranked) < config.count:
         warn(
             f"produced {len(ranked)} unique candidates, fewer than requested {config.count}; "
-            "widen the profile, --years range, or length window for more"
+            "widen the profile, context, --years range, or length window for more"
         )
     return ranked[: config.count]
 
 
-def _resolve_policy(
-    config: Config,
+def _is_handle_safe(value: str) -> bool:
+    return all(ch.isalnum() or ch in "._-" for ch in value)
+
+
+def _clean_tokens(words: Sequence[str]) -> list[str]:
+    """Alnum-only, lowercased, deduped — usable as permutation tokens."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for w in words:
+        t = "".join(ch for ch in w if ch.isalnum()).lower()
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def _rule_bases(
+    profile: Profile,
+    plan: BuildPlan,
     is_username: bool,
-    progress: Callable[[str], None],
-    warn: Callable[[str], None],
-) -> context.ContextPolicy:
-    """Decide the common-credential policy: manual override > LLM > regex rules."""
-    if config.common_weight is not None:
-        policy = context.ContextPolicy(
-            category="manual",
-            common_weight=max(0.0, config.common_weight),
-            note=f"forced --common-weight {config.common_weight:g}",
-        )
-    elif config.use_llm:
-        policy = context.llm_policy(
-            config.profile,
-            is_username=is_username,
-            backend=config.llm_backend,
-            model=config.llm_model,
-            host=config.llm_host,
-            timeout=config.llm_timeout,
-            warn=warn,
-        )
+    last_tokens: Sequence[str],
+) -> list[str]:
+    """The base words the mangling rules run against, bounded so rules × bases
+    can't explode."""
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def add(word: str) -> None:
+        word = word.strip()
+        key = word.lower()
+        if word and key not in seen and len(word) <= 40:
+            seen.add(key)
+            out.append(word)
+
+    if is_username:
+        for base in perms.username_bases(profile):
+            add(base)
+        for base in perms.fragment_bases(plan.fragments, last_tokens):
+            add(base)
     else:
-        policy = context.classify(config.profile, is_username=is_username)
-    progress(f"context policy: {policy.category} weight={policy.common_weight:.2f} — {policy.note}")
-    return policy
+        for tok in perms.password_tokens(profile):
+            add(tok)
+    for word in list(plan.fragments) + list(plan.themed_seeds):
+        add(word)
+    return out[:80]
 
 
 def _inject_common(

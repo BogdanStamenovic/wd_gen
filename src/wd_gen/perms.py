@@ -189,6 +189,18 @@ def _username_bases(profile: Profile) -> list[str]:
     return bases
 
 
+def decorate_username(form: str, numbers: Sequence[str]) -> Iterator[str]:
+    """Number/case/separator decoration applied to one handle base form."""
+    yield form
+    if len(form) > 2:
+        yield form.capitalize()
+    for num in numbers:
+        yield form + num
+    for num in numbers[:24]:
+        yield form + "_" + num
+        yield form + "." + num
+
+
 def iter_usernames(
     profile: Profile,
     *,
@@ -198,14 +210,53 @@ def iter_usernames(
     numbers = _number_bank(profile, year_range)
     for base in _username_bases(profile):
         for form in _leet_variants(base):
-            yield form
-            if len(form) > 2:
-                yield form.capitalize()
-            for num in numbers:
-                yield form + num
-            for num in numbers[:24]:
-                yield form + "_" + num
-                yield form + "." + num
+            yield from decorate_username(form, numbers)
+
+
+def last_name_tokens(profile: Profile) -> list[str]:
+    """The surname word(s) from every name structure — for fragment blending."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for parts in _name_structures(profile):
+        if len(parts) >= 2:
+            last = parts[-1]
+            if last not in seen:
+                seen.add(last)
+                out.append(last)
+    return out
+
+
+def fragment_bases(fragments: Sequence[str], last_tokens: Sequence[str]) -> list[str]:
+    """Turn creative name fragments into handle bases, blended with the surname.
+
+    This is what systematically produces ``bodas`` from the model's guess
+    ``boda``: each fragment is emitted on its own *and* combined with the
+    surname's initial and leading letters (``boda`` + ``s`` from *Stamenovic*).
+    The model supplies the culturally-plausible stems it can't be derived
+    algorithmically; the engine does the exhaustive blending.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def add(s: str) -> None:
+        s = "".join(ch for ch in s if ch.isalnum()).lower()
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+
+    for frag in fragments:
+        parts = _words(frag)
+        base = "".join(parts)
+        if not base:
+            continue
+        add(base)
+        for last in last_tokens:
+            add(base + last[0])            # boda + s -> bodas
+            add(base + last[: max(2, len(last) // 2)])
+            add(base + last)
+            add(base + "." + last)
+            add(base + "_" + last)
+    return out
 
 
 # --- password permutations --------------------------------------------------
@@ -231,6 +282,22 @@ def _password_tokens(profile: Profile) -> list[str]:
     return out
 
 
+def decorate_password(form: str, numbers: Sequence[str]) -> Iterator[str]:
+    """Number/symbol/policy-shape decoration applied to one password base form."""
+    yield form
+    for num in numbers:
+        yield form + num
+    for sym in COMMON_SYMBOLS:
+        yield form + sym
+    # The "policy-satisfying" shapes: word + number + symbol.
+    for num in numbers[:16]:
+        for sym in ("!", "@", "#", "$", "1!"):
+            yield form + num + sym
+    for sym in ("!", "@"):
+        for num in numbers[:8]:
+            yield sym + form + num
+
+
 def iter_passwords(
     profile: Profile,
     rng: random.Random,
@@ -246,22 +313,10 @@ def iter_passwords(
     del rng
     tokens = _password_tokens(profile)
     numbers = _number_bank(profile, year_range)
-    sym_sample = COMMON_SYMBOLS
 
     for tok in tokens:
         for form in [*_cap_variants(tok), *_leet_variants(tok)]:
-            yield form
-            for num in numbers:
-                yield form + num
-            for sym in sym_sample:
-                yield form + sym
-            # The "policy-satisfying" shapes: word + number + symbol.
-            for num in numbers[:16]:
-                for sym in ("!", "@", "#", "$", "1!"):
-                    yield form + num + sym
-            for sym in ("!", "@"):
-                for num in numbers[:8]:
-                    yield sym + form + num
+            yield from decorate_password(form, numbers)
 
     # Two-token combos (name+pet, name+org, first+last already glued above too).
     for i, a in enumerate(tokens):
@@ -276,6 +331,14 @@ def iter_passwords(
                 yield combo.capitalize() + num + "!"
         if i > 40:  # keep the O(n^2) bounded on large profiles
             break
+
+
+# Public handles onto the internal builders, for the plan executor in generate.
+number_bank = _number_bank
+cap_variants = _cap_variants
+leet_variants = _leet_variants
+password_tokens = _password_tokens
+username_bases = _username_bases
 
 
 # --- plausibility scoring ---------------------------------------------------

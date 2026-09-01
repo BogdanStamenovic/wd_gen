@@ -112,4 +112,4 @@ def test_missing_wordlist_is_error(capsys) -> None:
 
 def test_empty_profile_warns(capsys) -> None:
     main(["--count", "10"])
-    assert "needs a target" in capsys.readouterr().err
+    assert "no target facts" in capsys.readouterr().err

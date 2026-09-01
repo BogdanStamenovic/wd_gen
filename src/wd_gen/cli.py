@@ -13,11 +13,13 @@ import argparse
 import json
 import os
 import random
+import re
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 from typing import NoReturn
 
-from . import __version__
+from . import __version__, planner
 from .absurd import DEFAULT_OLLAMA_HOST
 from .generate import (
     Config,
@@ -28,7 +30,10 @@ from .generate import (
 )
 from .mangle import DEFAULT_RULES, RULES
 from .perms import DEFAULT_YEAR_RANGE
+from .plan import BuildPlan, plan_to_dict
 from .profile import Profile, ProfileError
+
+_USERNAME_HINT = re.compile(r"\b(user ?names?|handles?|screen ?names?|nick(?:names?)?)\b", re.IGNORECASE)
 
 
 class _UsageError(Exception):
@@ -66,6 +71,8 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="how many candidates to emit (default: 5000)")
     parser.add_argument("-u", "--usernames", action="store_true",
                         help="generate usernames/handles instead of passwords")
+    parser.add_argument("-i", "--interactive", action="store_true",
+                        help="prompt for purpose + context (auto on a TTY with no target given)")
     parser.add_argument("--chaos", action="store_true",
                         help="absurd meme mode instead of realistic OSINT guesses")
 
@@ -76,9 +83,12 @@ def _build_parser() -> argparse.ArgumentParser:
     prof.add_argument("--nick", action="append", metavar="NICK", help="nickname/known handle (repeatable)")
     prof.add_argument("--org", action="append", metavar="ORG", help="employer/org (repeatable)")
     prof.add_argument("--framework", action="append", metavar="TECH", help="tech/interests (repeatable)")
-    prof.add_argument("--purpose", "--context", action="append", metavar="TEXT", dest="purpose",
-                      help="what the credential is FOR — 'instagram login', 'office wifi', "
-                           "'router admin page'. Drives how heavily common creds blend in. (repeatable)")
+    prof.add_argument("--purpose", action="append", metavar="TEXT", dest="purpose",
+                      help="what the credential is FOR — 'office wifi', 'instagram login'. "
+                           "Drives the plan (repeatable)")
+    prof.add_argument("--context", metavar="TEXT", dest="brief",
+                      help="free-text brief for the LLM planner: who the target is, the "
+                           "situation, any facts — like writing an email")
     prof.add_argument("--keyword", action="append", metavar="WORD", help="city, hobby, job, anything (repeatable)")
     prof.add_argument("--pet", action="append", metavar="NAME", help="pet name (repeatable)")
     prof.add_argument("--birthday", "--date", action="append", metavar="D", dest="date",
@@ -108,6 +118,11 @@ def _build_parser() -> argparse.ArgumentParser:
     llm.add_argument("--llm-count", type=int, default=40, help="how many lines to ask the LLM for (default: 40)")
     llm.add_argument("--llm-timeout", type=float, default=120.0, help="seconds to wait on the LLM (default: 120)")
 
+    plan_grp = parser.add_argument_group("build plan (LLM planner)")
+    plan_grp.add_argument("--plan", metavar="FILE", help="run a saved plan JSON instead of asking the planner")
+    plan_grp.add_argument("--show-plan", action="store_true", help="print the build plan to stderr before generating")
+    plan_grp.add_argument("--plan-only", action="store_true", help="print the build plan JSON to stdout and exit (no wordlist)")
+
     out = parser.add_argument_group("output")
     out.add_argument("--json", action="store_true", help="emit JSON objects (value, score, source) instead of plain lines")
 
@@ -134,6 +149,45 @@ def _profile_from_args(args: argparse.Namespace) -> Profile:
         }
     )
     return base.merge(inline)
+
+
+def _infer_username_mode(*texts: str) -> bool:
+    return any(_USERNAME_HINT.search(t or "") for t in texts)
+
+
+def _prompt_brief() -> tuple[str, str]:
+    """Interactive brief: one-line purpose, then a free-text context paragraph.
+
+    Prompts go to stderr so stdout stays wordlist-only. Context ends on a blank
+    line or EOF (Ctrl-D).
+    """
+    print("wd_gen: describe the target like you're writing a short email.", file=sys.stderr)
+    print("purpose (what the credential is, e.g. 'office wifi password'):", file=sys.stderr)
+    print("> ", end="", file=sys.stderr, flush=True)
+    purpose = (sys.stdin.readline() or "").strip()
+    print("context (who/where/facts; end with a blank line or Ctrl-D):", file=sys.stderr)
+    print("> ", end="", file=sys.stderr, flush=True)
+    lines: list[str] = []
+    for line in sys.stdin:
+        if not line.strip():
+            break
+        lines.append(line.rstrip("\n"))
+    return purpose, " ".join(lines).strip()
+
+
+def _load_plan(path: str) -> BuildPlan:
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise WdGenError(f"cannot read plan {path}: {exc}") from exc
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise WdGenError(f"invalid JSON in plan {path}: {exc}") from exc
+    plan = BuildPlan.parse(data, source="file")
+    if plan is None:
+        raise WdGenError(f"plan {path}: top-level JSON must be an object")
+    return plan
 
 
 def _parse_years(spec: str | None) -> tuple[int, int]:
@@ -196,19 +250,73 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     style = "chaos" if args.chaos else "realistic"
-    if profile.is_empty() and style == "realistic":
-        warn("no target facts given — realistic mode needs a target. Add --owner/--nick/--birthday/...")
+
+    purpose = " ".join(args.purpose or []).strip()
+    brief = (args.brief or "").strip()
+
+    # Interactive brief: when asked, or on a TTY with nothing else to go on.
+    want_interactive = style == "realistic" and not args.plan and (
+        args.interactive
+        or (
+            sys.stdin.isatty() and profile.is_empty()
+            and not purpose and not brief and not args.usernames
+        )
+    )
+    if want_interactive:
+        purpose, brief = _prompt_brief()
+
+    # The short purpose is also a profile field, so the heuristic classifier and
+    # token engine see it even without the LLM.
+    if purpose:
+        profile = profile.merge(Profile.from_mapping({"purpose": [purpose]}))
+
+    mode = "usernames" if (args.usernames or _infer_username_mode(purpose, brief)) else "passwords"
+
+    # Resolve the build plan (realistic only). Order: saved file > LLM planner
+    # (when --llm / interactive / a brief is given) > None (generate builds the
+    # heuristic plan itself, unless we need one to show).
+    plan: BuildPlan | None = None
+    if style == "realistic":
+        try:
+            if args.plan:
+                plan = _load_plan(args.plan)
+            elif args.llm or want_interactive or brief:
+                plan = planner.llm_plan(
+                    profile, purpose, brief, mode=mode,
+                    backend=args.llm_backend, model=args.llm_model, host=args.llm_host,
+                    timeout=args.llm_timeout, warn=warn, progress=vlog,
+                )
+            elif args.show_plan or args.plan_only:
+                plan = planner.heuristic_plan(profile, mode=mode)
+        except WdGenError as exc:
+            print(f"wd_gen: error: {exc}", file=sys.stderr)
+            return 1
+        if plan is not None:
+            mode = plan.mode
+
+    if plan is not None and (args.show_plan or args.plan_only):
+        rendered = json.dumps(plan_to_dict(plan), ensure_ascii=False, indent=2)
+        if args.plan_only:
+            print(rendered)
+            log(f"wd_gen: plan only ({plan.source}); no wordlist generated")
+            return 0
+        print(rendered, file=sys.stderr)
+
+    has_material = bool(plan and (plan.fragments or plan.fields)) or not profile.is_empty()
+    if style == "realistic" and not has_material:
+        warn("no target facts — give --owner/--birthday/..., a --context brief, or run interactively")
 
     config = Config(
         profile=profile,
         count=args.count,
-        mode="usernames" if args.usernames else "passwords",
+        mode=mode,
         style=style,
         min_len=args.min_len,
         max_len=args.max_len,
         year_range=year_range,
         include_common=not args.no_common,
         common_weight=args.common_weight,
+        plan=plan,
         wordlist=wordlist,
         rules=rules,
         use_llm=args.llm,
