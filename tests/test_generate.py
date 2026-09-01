@@ -90,12 +90,21 @@ def test_realistic_reaches_reasonable_volume() -> None:
     assert len({c.value for c in out}) == len(out)
 
 
-def test_empty_profile_realistic_is_empty_with_warning() -> None:
+def test_empty_profile_without_common_is_empty_with_warning() -> None:
     warnings: list[str] = []
-    cfg = Config(profile=Profile(), count=100)
+    cfg = Config(profile=Profile(), count=100, include_common=False)
     out = generate(cfg, random.Random(1), warn=warnings.append)
     assert out == []
     assert warnings
+
+
+def test_empty_profile_still_yields_common_creds() -> None:
+    # With no target, the generic common list is a useful standalone wordlist.
+    cfg = Config(profile=Profile(), count=100)
+    out = generate(cfg, random.Random(1))
+    assert out
+    assert all(c.source == "common" for c in out)
+    assert "123456" in {c.value for c in out}
 
 
 # --- chaos mode still works -------------------------------------------------

@@ -4,7 +4,17 @@ import json
 
 import pytest
 
-from wd_gen.cli import main
+from wd_gen.absurd import DEFAULT_OLLAMA_HOST
+from wd_gen.cli import _default_llm_host, main
+
+
+def test_default_llm_host_uses_env(monkeypatch) -> None:
+    monkeypatch.delenv("OLLAMA_HOST", raising=False)
+    assert _default_llm_host() == DEFAULT_OLLAMA_HOST
+    monkeypatch.setenv("OLLAMA_HOST", "myhost:9999")
+    assert _default_llm_host() == "http://myhost:9999"  # bare host:port normalised
+    monkeypatch.setenv("OLLAMA_HOST", "https://secure:443")
+    assert _default_llm_host() == "https://secure:443"  # explicit scheme preserved
 
 
 def test_version(capsys) -> None:

@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import sys
 from collections.abc import Sequence
 from typing import NoReturn
 
 from . import __version__
+from .absurd import DEFAULT_OLLAMA_HOST
 from .generate import (
     Config,
     WdGenError,
@@ -31,6 +33,14 @@ from .profile import Profile, ProfileError
 
 class _UsageError(Exception):
     pass
+
+
+def _default_llm_host() -> str:
+    """$OLLAMA_HOST (normalised to a URL) if set, else the archserver default."""
+    raw = os.environ.get("OLLAMA_HOST", "").strip()
+    if not raw:
+        return DEFAULT_OLLAMA_HOST
+    return raw if "://" in raw else f"http://{raw}"
 
 
 class _ArgumentParser(argparse.ArgumentParser):
@@ -66,7 +76,9 @@ def _build_parser() -> argparse.ArgumentParser:
     prof.add_argument("--nick", action="append", metavar="NICK", help="nickname/known handle (repeatable)")
     prof.add_argument("--org", action="append", metavar="ORG", help="employer/org (repeatable)")
     prof.add_argument("--framework", action="append", metavar="TECH", help="tech/interests (repeatable)")
-    prof.add_argument("--purpose", action="append", metavar="TEXT", help="context (repeatable)")
+    prof.add_argument("--purpose", "--context", action="append", metavar="TEXT", dest="purpose",
+                      help="what the credential is FOR — 'instagram login', 'office wifi', "
+                           "'router admin page'. Drives how heavily common creds blend in. (repeatable)")
     prof.add_argument("--keyword", action="append", metavar="WORD", help="city, hobby, job, anything (repeatable)")
     prof.add_argument("--pet", action="append", metavar="NAME", help="pet name (repeatable)")
     prof.add_argument("--birthday", "--date", action="append", metavar="D", dest="date",
@@ -75,6 +87,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     gen = parser.add_argument_group("generation")
     gen.add_argument("--years", metavar="LO-HI", help=f"year range appended to names (default: {DEFAULT_YEAR_RANGE[0]}-{DEFAULT_YEAR_RANGE[1] - 1})")
+    gen.add_argument("--no-common", action="store_true",
+                     help="don't blend in generic common credentials (admin123, admin/root ...)")
+    gen.add_argument("--common-weight", type=float, metavar="W",
+                     help="force how heavily common creds rank: 0=suppress, ~1=interleave, "
+                          "~1.6=top of list. Overrides context/LLM detection.")
     gen.add_argument("--min-len", type=int, default=3, help="drop candidates shorter than this (default: 3)")
     gen.add_argument("--max-len", type=int, default=48, help="drop candidates longer than this (default: 48)")
     gen.add_argument("--seed", type=int, help="RNG seed for reproducible output")
@@ -84,8 +101,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     llm = parser.add_argument_group("local LLM layer (optional, best-effort)")
     llm.add_argument("--llm", action="store_true", help="also ask a local LLM for context-aware candidates")
-    llm.add_argument("--llm-backend", choices=("ollama", "claude"), default="ollama", help="local model runner (default: ollama)")
+    llm.add_argument("--llm-backend", choices=("ollama", "claude"), default="ollama", help="model runner (default: ollama HTTP API)")
     llm.add_argument("--llm-model", default="goekdenizguelmez/JOSIEFIED-Qwen3:8b", help="ollama model tag (ignored for claude backend)")
+    llm.add_argument("--llm-host", default=_default_llm_host(),
+                     help=f"ollama server URL (default: $OLLAMA_HOST or {DEFAULT_OLLAMA_HOST})")
     llm.add_argument("--llm-count", type=int, default=40, help="how many lines to ask the LLM for (default: 40)")
     llm.add_argument("--llm-timeout", type=float, default=120.0, help="seconds to wait on the LLM (default: 120)")
 
@@ -188,11 +207,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         min_len=args.min_len,
         max_len=args.max_len,
         year_range=year_range,
+        include_common=not args.no_common,
+        common_weight=args.common_weight,
         wordlist=wordlist,
         rules=rules,
         use_llm=args.llm,
         llm_backend=args.llm_backend,
         llm_model=args.llm_model,
+        llm_host=args.llm_host,
         llm_count=args.llm_count,
         llm_timeout=args.llm_timeout,
     )

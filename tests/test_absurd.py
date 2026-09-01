@@ -33,21 +33,22 @@ def test_strip_thinking_tags() -> None:
     assert "reasoning" not in _strip_thinking(raw)
 
 
-def test_llm_lines_missing_backend_is_graceful() -> None:
+def test_llm_lines_unreachable_host_is_graceful() -> None:
     warnings: list[str] = []
     out = llm_lines(
         "- owner: x",
         backend="ollama",
-        model="definitely-not-installed:0b",
+        model="whatever:0b",
+        host="http://127.0.0.1:1",  # nothing listens here -> connection refused
         count=5,
         kind="passwords",
         timeout=5.0,
         warn=warnings.append,
     )
-    # Either the binary is absent, or the model pull fails — both must degrade
-    # to [] with a warning, never raise.
+    # An unreachable ollama host must degrade to [] with a warning, never raise.
     assert out == []
     assert warnings
+    assert "unreachable" in warnings[-1].lower()
 
 
 def test_absurd_candidates_use_profile_tokens() -> None:

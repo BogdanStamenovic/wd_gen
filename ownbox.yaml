@@ -5,6 +5,9 @@ homepage: https://github.com/BogdanStamenovic/wd_gen
 tags: [cli, osint, wordlist, password, ctf, python]
 install:
   platforms: [linux, darwin, windows]
+  # The optional --llm layer talks to an ollama server over HTTP (default host:
+  # http://archserver:11434, override with --llm-host or $OLLAMA_HOST), so there
+  # is no local model to pull — install is just the venv + package.
   setup:
     linux:
       - python -m venv .venv

@@ -17,13 +17,21 @@ strongest bits float to the top when the output is capped.
 
 from __future__ import annotations
 
+import json
 import random
 import re
 import shutil
 import subprocess
+import urllib.error
+import urllib.request
 from collections.abc import Callable, Iterator, Sequence
 
 from . import banks
+
+# Bogdan's box runs the model over ollama's HTTP API (reachable on the tailnet),
+# so the default backend talks to it directly — no local ollama binary needed.
+# Override with --llm-host or $OLLAMA_HOST.
+DEFAULT_OLLAMA_HOST = "http://archserver:11434"
 
 # Words we recognise as "themed" for scoring — a flat lowercase set of the banks.
 _THEME_WORDS: frozenset[str] = frozenset(
@@ -296,40 +304,85 @@ def _sanitize_line(line: str) -> str | None:
     return line
 
 
-def llm_lines(
-    profile_desc: str,
+def llm_complete(
+    prompt: str,
     *,
     backend: str,
     model: str,
-    count: int,
-    kind: str,
-    style: str = "realistic",
+    host: str = DEFAULT_OLLAMA_HOST,
     timeout: float,
     warn: Callable[[str], None],
-) -> list[str]:
-    """Ask a local LLM for candidate lines. Returns [] (with a warning) on any snag.
+) -> str | None:
+    """Run one prompt through an LLM backend, return the raw text or ``None``.
 
-    Best-effort by contract: the deterministic engine always covers the count, so
-    a missing binary, a cold model, or a timeout degrades to "no LLM flavour this
-    run" rather than a hard failure.
+    The single shared entry point. ``ollama`` talks to a running ollama server
+    over its HTTP API (``host``); ``claude`` shells out to ``claude -p``. Every
+    failure mode (unreachable host, timeout, non-zero exit) becomes ``None`` plus
+    a stderr warning, and ``<think>`` blocks are stripped so callers only see the
+    answer. Best-effort by contract — no caller hard-fails on an absent LLM.
     """
-    prompt = _build_prompt(profile_desc, count, kind, style)
     if backend == "ollama":
-        if shutil.which("ollama") is None:
-            warn("llm: 'ollama' not on PATH; skipping LLM layer")
-            return []
-        cmd = ["ollama", "run", model]
-    elif backend == "claude":
-        if shutil.which("claude") is None:
-            warn("llm: 'claude' not on PATH; skipping LLM layer")
-            return []
-        cmd = ["claude", "-p"]
-    else:
-        raise LLMError(f"unknown llm backend {backend!r}")
+        return _ollama_generate(prompt, host=host, model=model, timeout=timeout, warn=warn)
+    if backend == "claude":
+        return _claude_generate(prompt, timeout=timeout, warn=warn)
+    raise LLMError(f"unknown llm backend {backend!r}")
 
+
+def _ollama_generate(
+    prompt: str,
+    *,
+    host: str,
+    model: str,
+    timeout: float,
+    warn: Callable[[str], None],
+) -> str | None:
+    """POST to ``{host}/api/generate`` (non-streaming), return the response text.
+
+    ``think: false`` keeps the thinking-model reasoning out of the payload; the
+    ``_strip_thinking`` pass is kept as a belt-and-braces fallback.
+    """
+    url = host.rstrip("/") + "/api/generate"
+    payload = json.dumps(
+        {"model": model, "prompt": prompt, "stream": False, "think": False}
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=payload, headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace").strip()[:200] or exc.reason
+        warn(f"llm: ollama at {host} returned {exc.code}: {detail}; skipping LLM layer")
+        return None
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        reason = getattr(exc, "reason", exc)
+        warn(f"llm: ollama at {host} unreachable ({reason}); skipping LLM layer")
+        return None
+    except (json.JSONDecodeError, ValueError):
+        warn(f"llm: ollama at {host} returned unparseable JSON; skipping LLM layer")
+        return None
+
+    response = data.get("response") if isinstance(data, dict) else None
+    if not response:
+        warn(f"llm: ollama at {host} returned an empty response; skipping LLM layer")
+        return None
+    return _strip_thinking(response)
+
+
+def _claude_generate(
+    prompt: str,
+    *,
+    timeout: float,
+    warn: Callable[[str], None],
+) -> str | None:
+    """Keyless fallback backend: shell out to ``claude -p``."""
+    if shutil.which("claude") is None:
+        warn("llm: 'claude' not on PATH; skipping LLM layer")
+        return None
     try:
         proc = subprocess.run(
-            cmd,
+            ["claude", "-p"],
             input=prompt,
             capture_output=True,
             text=True,
@@ -337,19 +390,43 @@ def llm_lines(
             check=False,
         )
     except subprocess.TimeoutExpired:
-        warn(f"llm: {backend} timed out after {timeout:g}s; skipping LLM layer")
-        return []
+        warn(f"llm: claude timed out after {timeout:g}s; skipping LLM layer")
+        return None
     except OSError as exc:
-        warn(f"llm: could not run {backend}: {exc}; skipping LLM layer")
-        return []
-
+        warn(f"llm: could not run claude: {exc}; skipping LLM layer")
+        return None
     if proc.returncode != 0:
         detail = proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else "no stderr"
-        warn(f"llm: {backend} exited {proc.returncode}: {detail}; skipping LLM layer")
+        warn(f"llm: claude exited {proc.returncode}: {detail}; skipping LLM layer")
+        return None
+    return _strip_thinking(proc.stdout)
+
+
+def llm_lines(
+    profile_desc: str,
+    *,
+    backend: str,
+    model: str,
+    host: str = DEFAULT_OLLAMA_HOST,
+    count: int,
+    kind: str,
+    style: str = "realistic",
+    timeout: float,
+    warn: Callable[[str], None],
+) -> list[str]:
+    """Ask an LLM for candidate lines. Returns [] (with a warning) on any snag.
+
+    Best-effort by contract: the deterministic engine always covers the count, so
+    an unreachable host, a cold model, or a timeout degrades to "no LLM flavour
+    this run" rather than a hard failure.
+    """
+    prompt = _build_prompt(profile_desc, count, kind, style)
+    text = llm_complete(prompt, backend=backend, model=model, host=host, timeout=timeout, warn=warn)
+    if text is None:
         return []
 
     out: list[str] = []
-    for raw in _strip_thinking(proc.stdout).splitlines():
+    for raw in text.splitlines():
         cleaned = _sanitize_line(raw)
         if cleaned:
             out.append(cleaned)

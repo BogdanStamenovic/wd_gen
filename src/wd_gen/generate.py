@@ -23,7 +23,7 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from importlib.resources import files
 
-from . import absurd, perms
+from . import absurd, context, perms
 from .mangle import DEFAULT_RULES, mangle
 from .profile import Profile
 
@@ -48,6 +48,9 @@ class Config:
     min_len: int = 3
     max_len: int = 48
     year_range: tuple[int, int] = perms.DEFAULT_YEAR_RANGE
+    # generic common-credential blending (realistic style)
+    include_common: bool = True
+    common_weight: float | None = None  # None = let context/LLM decide; else force
     # chaos-only knobs
     wordlist: list[str] = field(default_factory=list)
     rules: Sequence[str] = DEFAULT_RULES
@@ -56,6 +59,7 @@ class Config:
     use_llm: bool = False
     llm_backend: str = "ollama"
     llm_model: str = "goekdenizguelmez/JOSIEFIED-Qwen3:8b"
+    llm_host: str = absurd.DEFAULT_OLLAMA_HOST
     llm_count: int = 40
     llm_timeout: float = 120.0
 
@@ -127,30 +131,40 @@ def _generate_realistic(
     progress: Callable[[str], None],
     warn: Callable[[str], None],
 ) -> list[Candidate]:
+    is_username = config.mode == "usernames"
     base_tokens = perms.personal_tokens(config.profile)
     hot_numbers = frozenset(perms.expand_dates(config.profile))
     progress(f"target tokens: {len(base_tokens)} -> {base_tokens[:8]}")
 
     pool: dict[str, Candidate] = {}
 
-    def add(value: str, source: str) -> None:
+    def add(value: str, source: str, score: float | None = None) -> None:
         value = value.strip()
         if not (config.min_len <= len(value) <= config.max_len):
             return
-        s = perms.plausibility(value, base_tokens, hot_numbers)
-        if source == "llm":
-            s += 0.5  # the model saw the whole profile; nudge its picks up
+        if score is None:
+            score = perms.plausibility(value, base_tokens, hot_numbers)
+            if source == "llm":
+                score += 0.5  # the model saw the whole profile; nudge its picks up
         cur = pool.get(value)
-        if cur is None or s > cur.score:
-            pool[value] = Candidate(value=value, score=s, source=source)
+        if cur is None or score > cur.score:
+            pool[value] = Candidate(value=value, score=score, source=source)
 
-    if config.mode == "usernames":
+    if is_username:
         for u in perms.iter_usernames(config.profile, year_range=config.year_range):
             add(u, "perm")
     else:
         for p in perms.iter_passwords(config.profile, rng, year_range=config.year_range):
             add(p, "perm")
     progress(f"after permutations: {len(pool)}")
+
+    # Generic common credentials (admin123, password1, admin/root...) — the class
+    # a targeted profile never covers on its own. How heavily they blend in, and
+    # whether they belong at all, is decided by the context (LLM or regex).
+    if config.include_common:
+        policy = _resolve_policy(config, is_username, progress, warn)
+        _inject_common(policy, is_username, config, add)
+        progress(f"after common creds: {len(pool)}")
 
     if config.use_llm:
         _run_llm(config, pool, add, progress, warn)
@@ -168,6 +182,54 @@ def _generate_realistic(
             "widen the profile, --years range, or length window for more"
         )
     return ranked[: config.count]
+
+
+def _resolve_policy(
+    config: Config,
+    is_username: bool,
+    progress: Callable[[str], None],
+    warn: Callable[[str], None],
+) -> context.ContextPolicy:
+    """Decide the common-credential policy: manual override > LLM > regex rules."""
+    if config.common_weight is not None:
+        policy = context.ContextPolicy(
+            category="manual",
+            common_weight=max(0.0, config.common_weight),
+            note=f"forced --common-weight {config.common_weight:g}",
+        )
+    elif config.use_llm:
+        policy = context.llm_policy(
+            config.profile,
+            is_username=is_username,
+            backend=config.llm_backend,
+            model=config.llm_model,
+            host=config.llm_host,
+            timeout=config.llm_timeout,
+            warn=warn,
+        )
+    else:
+        policy = context.classify(config.profile, is_username=is_username)
+    progress(f"context policy: {policy.category} weight={policy.common_weight:.2f} — {policy.note}")
+    return policy
+
+
+def _inject_common(
+    policy: context.ContextPolicy,
+    is_username: bool,
+    config: Config,
+    add: Callable[..., None],
+) -> None:
+    """Blend frequency-ranked common creds + context seeds in per ``policy``."""
+    if not policy.suppressed:
+        creds = context.common_credentials(is_username=is_username)
+        total = len(creds)
+        for rank, cred in enumerate(creds):
+            add(cred, "common", context.common_score(rank, total, policy))
+    # Context-specific seeds (an SSID, a service word) ride along as strong common
+    # hits even when the generic list is suppressed.
+    seed_weight = max(policy.common_weight, 0.8)
+    for seed in policy.seeds:
+        add(seed, "common", policy.common_bias + seed_weight * 6.0)
 
 
 # --- chaos (absurd) engine --------------------------------------------------
@@ -268,12 +330,14 @@ def _run_llm(
     progress: Callable[[str], None],
     warn: Callable[[str], None],
 ) -> None:
-    progress(f"llm: asking {config.llm_backend}:{config.llm_model} for ~{config.llm_count}")
+    where = config.llm_host if config.llm_backend == "ollama" else config.llm_backend
+    progress(f"llm: asking {config.llm_model} @ {where} for ~{config.llm_count}")
     desc = _profile_description(config.profile)
     lines = absurd.llm_lines(
         desc,
         backend=config.llm_backend,
         model=config.llm_model,
+        host=config.llm_host,
         count=config.llm_count,
         kind=config.mode,
         style=config.style,
