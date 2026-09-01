@@ -1,43 +1,57 @@
 # wd_gen
 
-Generate absurd, memorable passwords and usernames from a target profile.
+Targeted OSINT/CTF credential wordlist generator. Give it a person's name and
+whatever facts you have; it emits the *plausible* usernames and passwords that
+specific person would actually pick — ranked most-likely-first, so the best
+guesses are at the top of the file.
 
-You give it the most info you can — who the owner is, what the framework is,
-what the thing is *for*, plus whatever trivia you've got — and it turns a
-generic base wordlist into a large pile (5000+ by default) of candidates. Half
-of them are ordinary hashcat-style manglings; the other half are unhinged
-passphrases that read like a Discord handle achieved sentience:
-`MoistHamsterOverlord69!`, `BogdanNextJs_deadass`, `ForbiddenGuacamoleBaron1337`.
-The point is the "are we for real bro" quality.
+This is the [CUPP](https://github.com/Mebus/cupp) +
+[username-anarchy](https://github.com/urbanadventurer/username-anarchy) lineage:
+credential *profiling*, not random tumbling. For a target named
+**Bogdan Stamenovix, born 2001, pet goose** it produces the systematic space a
+real person picks from —
 
-It is **not** a cracker and it does not hash, test, or spray anything. It writes
-lines to stdout. What you do with the list is your business — the intended use
-is generating memorable credentials for your own accounts and seeding your own
-password manager, or building a themed candidate set for authorized testing.
+```
+bogdans          bstamenovix      bogdan.stamenovix    bogdanstamenovix
+Bogdan2001       Bogdan123        Pigion2001           Bogdan230501   (DDMMYY)
+b0gdan           goosebogdan      Bogdan2001!          bstamen
+```
+
+— plus, optionally, a small local LLM to cover the non-systematic handles a
+person invents (`bogdanthegeese2001`, `stam3novix2001`).
+
+> **Authorized use only.** This is a tool for CTF challenges, OSINT exercises,
+> and password audits you are permitted to run. It generates a wordlist and
+> writes it to stdout — it does no hashing, cracking, spraying, or network I/O
+> of any kind. What you point it at is your responsibility.
 
 ## How it works
 
+Two engines, picked by a flag:
+
+**Realistic (default)** — enumerates the shapes people demonstrably choose from
+the target's own tokens:
+
 ```
-seeds  = profile tokens  (+ pairwise profile combos, high-signal)
-       + bundled/base wordlist
-raw    = mangle(seed, rules)          leet, case, number/symbol/meme tails, "bro"-isms
-       + absurd template passphrases  themed word banks, topped up to hit the count
-       + local-LLM lines              optional, context-aware, best-effort
-shaped = raw                          in password mode
-       | to_usernames(raw)            in username mode  (no spaces, url-safe)
-result = dedup, scored by absurdity/memorability, sorted, capped at --count
+usernames: first, last, first+last, f.last, first+lastinitial, initials,
+           truncations, nick, token+year, light leetspeak
+passwords: token + meaningful year/number (birthday expands to YYYY/YY/DDMM/
+           DDMMYYYY), + one symbol, name+name combos, Title/UPPER/leet casings
 ```
 
-Everything runs off a single seeded RNG, so `--seed N` reproduces a run exactly
-(the optional LLM layer aside — that's inherently non-deterministic).
+Ranked by a *plausibility* heuristic: the target's own name and **real** dates
+outrank generic years, plain handles stay near the top, symbol-soup sinks.
+
+**Chaos (`--chaos`)** — the absurd meme generator (themed word banks + rule
+mangling): `MoistHamsterOverlord69!`. Memorable, not realistic. It was the
+original ask, kept behind the flag.
+
+Both are deterministic under `--seed`; the optional LLM layer is not.
 
 ## Install
 
-Via [ownbox](https://github.com/BogdanStamenovic/ownbox):
-
-```yaml
-# ownbox.yaml is included; `ownbox install wd_gen` from the repo root
-```
+Via [ownbox](https://github.com/BogdanStamenovic/ownbox): `ownbox install wd_gen`
+from the repo root (`ownbox.yaml` is included).
 
 Manual (editable venv):
 
@@ -56,64 +70,71 @@ wd_gen [options] > wordlist.txt
 | Option | Meaning |
 | --- | --- |
 | `-n, --count N` | how many candidates to emit (default 5000) |
-| `-u, --usernames` | generate handles instead of passwords (no spaces, url-safe) |
-| `--profile FILE` | load a profile (JSON, or simple `field: a, b` lines) |
-| `--owner / --org / --framework / --purpose` | profile facts (repeatable, comma-ok) |
-| `--keyword / --pet / --date / --extra` | more profile facts (repeatable) |
-| `--wordlist FILE` | custom base wordlist instead of the bundled one |
-| `--rules a,b,c` | pick mangling rules (`--list-rules` to see them) |
-| `--min-len / --max-len` | length window (default 4–48) |
+| `-u, --usernames` | generate handles instead of passwords |
+| `--chaos` | absurd meme mode instead of realistic OSINT |
+| `--profile FILE` | load a target profile (JSON or `field: a, b` lines) |
+| `--owner "First Last"` | target's full name (repeatable) |
+| `--nick` | known nickname/handle (repeatable) |
+| `--birthday D` | birthday/year — `2001` or `23/05/2001` (repeatable) |
+| `--org / --pet / --keyword / --extra` | employer, pet, city/hobby/job, partner… |
+| `--years LO-HI` | year range appended to names (default 1970–2026) |
+| `--min-len / --max-len` | length window (default 3–48) |
 | `--seed N` | reproducible RNG |
-| `--llm` | also ask a local LLM for context-aware lines |
-| `--llm-backend ollama\|claude` | which local runner (default ollama) |
-| `--llm-model TAG` | ollama model tag |
+| `--llm` | also ask a local LLM (`--llm-backend ollama\|claude`, `--llm-model`) |
 | `--json` | emit `{value, score, source}` objects instead of plain lines |
-| `-v/-q` | verbose / quiet (both go to stderr) |
+| `-v/-q` | verbose / quiet (both to stderr) |
 
-stdout carries only the output (lines, or the JSON array), so it pipes cleanly.
-Progress, warnings and errors all go to stderr. Exit codes: `0` ok, `1` failed,
-`2` usage error.
+stdout carries only the wordlist (or the JSON array); progress, warnings and
+errors go to stderr. Exit codes: `0` ok, `1` failed, `2` usage error.
 
 ### Examples
 
 ```sh
-# 5000 absurd passwords pointed at a specific target
-wd_gen --owner "Bogdan Stamenovic" --org Pigion --framework Next.js \
-       --purpose "self-running infrastructure" --keyword archserver --seed 1
+# usernames for a target, birthday-aware ranking
+wd_gen -u --owner "Bogdan Stamenovix" --birthday 2001 --pet goose --seed 1
 
-# usernames instead
-wd_gen --usernames --owner Bogdan --framework Rust -n 2000
+# passwords, full date expands to DDMM / DDMMYY / DDMMYYYY tails
+wd_gen --owner "Bogdan Stamenovix" --birthday 23/05/2001 --org Acme -n 5000
 
-# load facts from a file, add local-LLM flavour, keep only 12–24 char results
-wd_gen --profile target.profile --llm --min-len 12 --max-len 24
+# add local-LLM coverage for the creative handles, keep 8–16 char results
+wd_gen -u --profile target.profile --llm --min-len 8 --max-len 16
 
-# reproducible JSON with scores and provenance
-wd_gen --owner Ada --seed 42 --json -n 100
+# reproducible JSON with plausibility scores and provenance
+wd_gen --owner "Ada Lovelace" --birthday 1815 --seed 42 --json -n 100
+
+# the original absurd mode, still here
+wd_gen --chaos --owner Bogdan --pet goose -n 3000
 ```
 
 A profile file is either JSON:
 
 ```json
-{ "owner": ["Bogdan"], "framework": ["Next.js", "FastAPI"], "keywords": "pigion, archserver" }
+{ "owner": ["Bogdan Stamenovix"], "birthday": ["23/05/2001"], "pet": ["goose"],
+  "keywords": "pigion, belgrade", "org": ["Acme"] }
 ```
 
 or the simpler line format:
 
 ```
-owner: Bogdan Stamenovic
-framework: Next.js, FastAPI
-keywords: pigion, archserver
+owner: Bogdan Stamenovix
+birthday: 23/05/2001
+pet: goose
+keywords: pigion, belgrade
 ```
 
 ## Limitations
 
-- **Not a security tool in the offensive sense.** It generates lines. It does
-  no hashing, cracking, credential testing, or network I/O of any kind.
+- **It generates lines. That's all.** No hashing, cracking, credential testing,
+  or network I/O. Feed the output to a tool you're authorized to run.
+- **Plausibility is a heuristic, not a guarantee.** It orders guesses by how
+  commonly real people pick each shape — it can't know your specific target's
+  quirks. Truly random handles (`b0g13a`) are where the `--llm` layer helps and
+  even then it's guessing.
 - **The LLM layer is best-effort.** If `ollama`/`claude` is missing, cold, or
-  times out, wd_gen warns on stderr and falls back to the deterministic template
-  floor — the requested count is always met without it.
-- **Absurdity/memorability scoring is a heuristic**, not a strength estimate.
-  A high score means "more unhinged and more memorable", not "harder to crack".
-  These are memorable by design, which is the opposite of high-entropy random.
-- **Dedup can saturate** a narrow request (tiny profile + tight length window +
-  few rules). When it can't reach `--count` it emits what it has and says so.
+  times out, wd_gen warns on stderr and the deterministic engine covers the
+  count on its own.
+- **Realistic mode needs a target.** With an empty profile it has nothing to
+  build from and emits nothing (with a warning). Use `--chaos` for target-free
+  generation.
+- **Dedup can fall short of `--count`** for a thin profile; it emits what it has
+  and says so. Widen the profile or the `--years` range for more.

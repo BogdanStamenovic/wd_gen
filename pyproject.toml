@@ -5,12 +5,12 @@ build-backend = "hatchling.build"
 [project]
 name = "wd_gen"
 version = "0.1.0"
-description = "Generate absurd, memorable passwords and usernames from a target profile"
+description = "Targeted OSINT/CTF username and password wordlist generator from a target profile"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Bogdan Stamenovic" }]
-keywords = ["password", "wordlist", "username", "generator", "cli"]
+keywords = ["osint", "wordlist", "password", "username", "ctf", "pentest", "cli"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",

@@ -2,31 +2,79 @@ from __future__ import annotations
 
 import random
 
-from wd_gen import absurd
 from wd_gen.generate import Config, generate, load_bundled_wordlist
-from wd_gen.mangle import mangle
+from wd_gen.perms import iter_passwords, iter_usernames, plausibility
 from wd_gen.profile import Profile
 
 
+def _target() -> Profile:
+    return Profile(names=["Bogdan Stamenovix"], pets=["goose"], dates=["2001"], keywords=["pigion"])
+
+
 def _cfg(**kw) -> Config:
-    base = {
-        "profile": Profile(names=["Bogdan"], framework=["NextJs"]),
-        "wordlist": load_bundled_wordlist(),
-        "count": 1000,
-    }
+    base: dict = {"profile": _target(), "count": 2000}
     base.update(kw)
     return Config(**base)
 
 
-def test_generate_hits_target_count() -> None:
-    out = generate(_cfg(count=5000), random.Random(1))
-    assert len(out) == 5000
-    assert len({c.value for c in out}) == 5000
+# --- realistic username shapes (the OSINT core) ----------------------------
 
 
-def test_generate_is_deterministic_under_seed() -> None:
-    a = generate(_cfg(count=800), random.Random(5))
-    b = generate(_cfg(count=800), random.Random(5))
+def test_usernames_include_expected_osint_shapes() -> None:
+    us = set(iter_usernames(_target()))
+    # The systematic handles a real person would register.
+    for expected in ("bogdan", "stamenovix", "bogdans", "bstamenovix", "bogdanstamenovix"):
+        assert expected in us, expected
+
+
+def test_usernames_have_separators_and_leet() -> None:
+    us = set(iter_usernames(_target()))
+    assert "bogdan.stamenovix" in us or "bogdan_stamenovix" in us
+    assert any(ch.isdigit() for u in us for ch in u)  # leet/number variants exist
+
+
+def test_username_name_plus_year() -> None:
+    us = set(iter_usernames(_target()))
+    assert any(u.startswith("bogdan") and "2001" in u for u in us)
+
+
+# --- realistic password shapes ---------------------------------------------
+
+
+def test_passwords_include_name_year_and_symbol_shapes() -> None:
+    pw = set(iter_passwords(_target(), random.Random(0)))
+    assert "Bogdan2001" in pw
+    assert "Bogdan123" in pw
+    assert any(p.startswith("Bogdan") and p.endswith("!") for p in pw)
+    assert "goose2001" in pw or "Goose2001" in pw
+
+
+def test_password_combos_of_tokens() -> None:
+    pw = set(iter_passwords(_target(), random.Random(0)))
+    assert any("goose" in p.lower() and "bogdan" in p.lower() for p in pw)
+
+
+# --- ranking: most-likely first --------------------------------------------
+
+
+def test_plausibility_prefers_common_over_soup() -> None:
+    toks = ["bogdan"]
+    assert plausibility("Bogdan2001", toks) > plausibility("B0gd4n@#$!x", toks)
+    assert plausibility("bogdan123", toks) > plausibility("stamenovix", ["stamenovix"]) - 5
+
+
+def test_realistic_top_is_name_derived(capsys=None) -> None:
+    out = generate(_cfg(count=200), random.Random(1))
+    top = [c.value.lower() for c in out[:50]]
+    assert any("bogdan" in v or "stamenovix" in v or "goose" in v for v in top)
+
+
+# --- pipeline properties ----------------------------------------------------
+
+
+def test_generate_deterministic_under_seed() -> None:
+    a = generate(_cfg(count=1000), random.Random(5))
+    b = generate(_cfg(count=1000), random.Random(5))
     assert [c.value for c in a] == [c.value for c in b]
 
 
@@ -36,40 +84,29 @@ def test_results_sorted_by_score_desc() -> None:
     assert scores == sorted(scores, reverse=True)
 
 
-def test_profile_tokens_appear_in_output() -> None:
-    out = generate(_cfg(count=2000), random.Random(3))
-    joined = "\n".join(c.value for c in out).lower()
-    assert "bogdan" in joined
+def test_realistic_reaches_reasonable_volume() -> None:
+    out = generate(_cfg(count=5000), random.Random(3))
+    assert len(out) > 3000  # rich profile fills thousands of plausible guesses
+    assert len({c.value for c in out}) == len(out)
+
+
+def test_empty_profile_realistic_is_empty_with_warning() -> None:
+    warnings: list[str] = []
+    cfg = Config(profile=Profile(), count=100)
+    out = generate(cfg, random.Random(1), warn=warnings.append)
+    assert out == []
+    assert warnings
+
+
+# --- chaos mode still works -------------------------------------------------
+
+
+def test_chaos_mode_hits_target_and_is_absurd() -> None:
+    cfg = Config(profile=_target(), count=3000, style="chaos", wordlist=load_bundled_wordlist())
+    out = generate(cfg, random.Random(1))
+    assert len(out) == 3000
+    assert {c.source for c in out} <= {"absurd", "rule", "llm"}
 
 
 def test_bundled_wordlist_nonempty() -> None:
     assert len(load_bundled_wordlist()) > 100
-
-
-def test_mangle_produces_variants() -> None:
-    rng = random.Random(0)
-    variants = set(mangle("dragon", ["leet", "numbers", "symbols"], rng))
-    assert len(variants) > 3
-    assert any(any(ch.isdigit() for ch in v) for v in variants)
-
-
-def test_score_prefers_passphrase_over_single_word() -> None:
-    assert absurd.score("MoistHamsterOverlord69") > absurd.score("dragon")
-
-
-def test_username_shaping_has_no_spaces() -> None:
-    rng = random.Random(1)
-    handles = list(absurd.to_usernames("Moist Hamster Overlord", rng))
-    assert handles
-    assert all(" " not in h for h in handles)
-
-
-def test_empty_profile_still_generates() -> None:
-    cfg = Config(profile=Profile(), wordlist=load_bundled_wordlist(), count=1000)
-    out = generate(cfg, random.Random(1))
-    assert len(out) == 1000
-
-
-def test_candidate_sources_are_known() -> None:
-    out = generate(_cfg(count=1500), random.Random(4))
-    assert {c.source for c in out} <= {"rule", "absurd", "llm"}

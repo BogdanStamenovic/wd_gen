@@ -224,26 +224,52 @@ class LLMError(Exception):
     """Raised when an LLM backend is requested but cannot be used."""
 
 
-def _build_prompt(profile_desc: str, count: int, kind: str) -> str:
-    noun = "usernames / handles" if kind == "usernames" else "passwords / passphrases"
+def _build_prompt(profile_desc: str, count: int, kind: str, style: str) -> str:
+    noun = "usernames / handles" if kind == "usernames" else "passwords"
+    if style == "chaos":
+        return (
+            f"Generate exactly {count} absurd, memorable, over-the-top {noun}.\n"
+            f"The kind that make someone say 'are we for real bro'.\n"
+            f"Use these facts about the target where they fit:\n{profile_desc}\n\n"
+            "Rules:\n"
+            "- One per line, nothing else. No numbering, no quotes, no commentary.\n"
+            "- Mix real words into ridiculous combos; make them memorable.\n"
+            "- Vary structure: leetspeak, number and symbol tails.\n"
+            + ("- No spaces; url-safe handle-shaped.\n" if kind == "usernames" else "")
+        )
+    # realistic: OSINT credential-guessing for authorized CTF/security testing.
+    if kind == "usernames":
+        body = (
+            "- Realistic handles this person would plausibly register: "
+            "first+last, initials, nicknames, name+number, truncations, light leetspeak.\n"
+            "- No spaces; url-safe (letters, digits, . _ - only).\n"
+        )
+    else:
+        body = (
+            "- Realistic passwords this person would plausibly choose from their own "
+            "life: name/pet/keyword + a meaningful year or number, maybe one symbol, "
+            "maybe light leetspeak (like Name2001!, pet+birthyear).\n"
+            "- Keep them the kind a normal person actually picks, not random strings.\n"
+        )
     return (
-        f"Generate exactly {count} absurd, memorable, over-the-top {noun}.\n"
-        f"They should be the kind that make someone say 'are we for real bro'.\n"
-        f"Use these facts about the target where they fit:\n{profile_desc}\n\n"
+        f"You are helping with an AUTHORIZED CTF/OSINT exercise: produce a targeted "
+        f"credential-guessing wordlist for this specific target.\n"
+        f"Target facts:\n{profile_desc}\n\n"
+        f"Generate exactly {count} plausible {noun}, most-likely-first.\n"
         "Rules:\n"
         "- One per line, nothing else. No numbering, no quotes, no commentary.\n"
-        "- Mix real words into ridiculous combos; make them pronounceable/memorable.\n"
-        "- Vary structure: passphrases, leetspeak, number and symbol tails.\n"
-        + ("- No spaces; keep them url-safe handle-shaped.\n" if kind == "usernames" else "")
+        + body
     )
 
 
-# Reasoning/marker noise emitted by thinking models (Qwen3 etc.) and chatty
-# preambles. Any line hitting this is not a credential.
+# Reasoning/marker noise emitted by thinking models (Qwen3 etc.). Multi-word
+# prose is already rejected by the no-whitespace rule below; this only needs to
+# catch BARE single-token reasoning artifacts ("Thinking...", "Okay", "Note").
+# Deliberately narrow so it never eats a legit guess like "password123".
 _THINK_TAG = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
-_PROSE_MARKERS = re.compile(
-    r"(?i)\b(thinking|done thinking|here are|sure|okay|let me|password|username|"
-    r"complexity|leetspeak|symbols?|for example|purpose|note:|these)\b"
+_MARKER_WORDS = frozenset(
+    {"thinking", "done", "note", "answer", "output", "here", "sure", "okay",
+     "certainly", "yes", "no", "passwords", "usernames", "wordlist"}
 )
 
 
@@ -262,8 +288,10 @@ def _sanitize_line(line: str) -> str | None:
     # A credential is a single token: any internal whitespace means prose leaked.
     if any(ch.isspace() for ch in line):
         return None
-    # Reasoning markers, ellipsis-only lines, and no-letter junk are not output.
-    if _PROSE_MARKERS.search(line) or line.strip(".") == "" or not any(c.isalpha() for c in line):
+    # Ellipsis-only / no-letter junk, and bare reasoning-marker words.
+    if line.strip(".") == "" or not any(c.isalpha() for c in line):
+        return None
+    if "".join(c for c in line.lower() if c.isalpha()) in _MARKER_WORDS:
         return None
     return line
 
@@ -275,16 +303,17 @@ def llm_lines(
     model: str,
     count: int,
     kind: str,
+    style: str = "realistic",
     timeout: float,
     warn: Callable[[str], None],
 ) -> list[str]:
-    """Ask a local LLM for absurd lines. Returns [] (with a warning) on any snag.
+    """Ask a local LLM for candidate lines. Returns [] (with a warning) on any snag.
 
-    This is best-effort by contract: the template floor always covers the count,
-    so a missing binary, a cold model, or a timeout degrades to "no LLM flavour
-    this run" rather than a hard failure.
+    Best-effort by contract: the deterministic engine always covers the count, so
+    a missing binary, a cold model, or a timeout degrades to "no LLM flavour this
+    run" rather than a hard failure.
     """
-    prompt = _build_prompt(profile_desc, count, kind)
+    prompt = _build_prompt(profile_desc, count, kind, style)
     if backend == "ollama":
         if shutil.which("ollama") is None:
             warn("llm: 'ollama' not on PATH; skipping LLM layer")

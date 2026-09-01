@@ -1,35 +1,35 @@
-"""Core orchestrator: profile + wordlist + rules + absurdity -> ranked output.
+"""Core orchestrator: target profile -> ranked credential candidates.
 
-The pipeline, end to end:
+Two engines, chosen by ``Config.style``:
 
-    seeds  = profile tokens  (+ pairwise profile combos, high-signal)
-           + bundled/base wordlist
-    raw    = mangle(seed, rules)          for every seed
-           + absurd template passphrases  (topped up to hit the target count)
-           + local-LLM lines              (optional, best-effort flavour)
-    shaped = raw                          in password mode
-           | to_usernames(raw)            in username mode
-    result = dedup(shaped), scored, sorted by absurdity/memorability, capped
+  * **realistic** (default) — the OSINT/CTF engine in ``perms``. Enumerates the
+    plausible usernames and passwords the *target* would actually pick from their
+    own name and facts (``first+last``, ``f.last``, ``name+year``, ``Name123!``,
+    light leet). Ranked most-likely-first so the best guesses are tried first.
 
-Everything is driven by a passed-in RNG so a given ``--seed`` reproduces the
-whole run bit for bit (the LLM layer aside, which is inherently non-deterministic
-and documented as such).
+  * **chaos** — the absurd meme engine in ``absurd`` + generic rule mangling.
+    The "are we for real bro" flavour: unhinged themed passphrases. Kept because
+    it was the original ask, now behind ``--chaos``.
+
+Both dedup, score, sort, and cap at ``Config.count``. Everything runs off the
+passed-in RNG so ``--seed`` reproduces a run (the optional LLM layer aside).
 """
 
 from __future__ import annotations
 
+import hashlib
 import random
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from importlib.resources import files
 
-from . import absurd
+from . import absurd, perms
 from .mangle import DEFAULT_RULES, mangle
 from .profile import Profile
 
 DEFAULT_COUNT = 5000
-# Hard ceiling on absurd-template top-up attempts, so a fully saturated dedup
-# set can never spin forever chasing an unreachable target.
+# Hard ceiling on template top-up attempts, so a fully saturated dedup set can
+# never spin forever chasing an unreachable target.
 _TOPUP_FACTOR = 8
 
 
@@ -42,16 +42,20 @@ class Config:
     """Everything a single generation run needs."""
 
     profile: Profile = field(default_factory=Profile)
+    count: int = DEFAULT_COUNT
+    mode: str = "passwords"  # "passwords" | "usernames"
+    style: str = "realistic"  # "realistic" (OSINT) | "chaos" (absurd memes)
+    min_len: int = 3
+    max_len: int = 48
+    year_range: tuple[int, int] = perms.DEFAULT_YEAR_RANGE
+    # chaos-only knobs
     wordlist: list[str] = field(default_factory=list)
     rules: Sequence[str] = DEFAULT_RULES
-    count: int = DEFAULT_COUNT
-    absurd_ratio: float = 0.6  # min fraction of output that must be absurd-template gold
-    mode: str = "passwords"  # "passwords" | "usernames"
-    min_len: int = 4
-    max_len: int = 48
+    absurd_ratio: float = 0.6
+    # local LLM (both styles)
     use_llm: bool = False
     llm_backend: str = "ollama"
-    llm_model: str = "JOSIEFIED-Qwen3:8b"
+    llm_model: str = "goekdenizguelmez/JOSIEFIED-Qwen3:8b"
     llm_count: int = 40
     llm_timeout: float = 120.0
 
@@ -60,11 +64,11 @@ class Config:
 class Candidate:
     value: str
     score: float
-    source: str  # "rule" | "absurd" | "llm"
+    source: str  # "perm" | "llm" | "absurd" | "rule"
 
 
 def load_bundled_wordlist() -> list[str]:
-    """Read the packaged generic base wordlist."""
+    """Read the packaged generic base wordlist (used by chaos style)."""
     text = files("wd_gen.data").joinpath("wordlist.txt").read_text(encoding="utf-8")
     return _parse_wordlist(text)
 
@@ -91,16 +95,158 @@ def _parse_wordlist(text: str) -> list[str]:
     return out
 
 
-def _seeds(profile: Profile, wordlist: Sequence[str]) -> list[str]:
-    """Profile tokens first (highest signal), then pairwise profile combos,
-    then the generic wordlist."""
+def generate(
+    config: Config,
+    rng: random.Random,
+    *,
+    progress: Callable[[str], None] | None = None,
+    warn: Callable[[str], None] | None = None,
+) -> list[Candidate]:
+    """Run the selected engine and return up to ``config.count`` ranked candidates."""
+    _progress = progress or (lambda _m: None)
+    _warn = warn or (lambda _m: None)
+
+    if config.mode not in ("passwords", "usernames"):
+        raise WdGenError(f"unknown mode {config.mode!r}")
+    if config.style not in ("realistic", "chaos"):
+        raise WdGenError(f"unknown style {config.style!r}")
+    if config.count < 1:
+        raise WdGenError("count must be >= 1")
+
+    if config.style == "realistic":
+        return _generate_realistic(config, rng, _progress, _warn)
+    return _generate_chaos(config, rng, _progress, _warn)
+
+
+# --- realistic (OSINT) engine ----------------------------------------------
+
+
+def _generate_realistic(
+    config: Config,
+    rng: random.Random,
+    progress: Callable[[str], None],
+    warn: Callable[[str], None],
+) -> list[Candidate]:
+    base_tokens = perms.personal_tokens(config.profile)
+    hot_numbers = frozenset(perms.expand_dates(config.profile))
+    progress(f"target tokens: {len(base_tokens)} -> {base_tokens[:8]}")
+
+    pool: dict[str, Candidate] = {}
+
+    def add(value: str, source: str) -> None:
+        value = value.strip()
+        if not (config.min_len <= len(value) <= config.max_len):
+            return
+        s = perms.plausibility(value, base_tokens, hot_numbers)
+        if source == "llm":
+            s += 0.5  # the model saw the whole profile; nudge its picks up
+        cur = pool.get(value)
+        if cur is None or s > cur.score:
+            pool[value] = Candidate(value=value, score=s, source=source)
+
+    if config.mode == "usernames":
+        for u in perms.iter_usernames(config.profile, year_range=config.year_range):
+            add(u, "perm")
+    else:
+        for p in perms.iter_passwords(config.profile, rng, year_range=config.year_range):
+            add(p, "perm")
+    progress(f"after permutations: {len(pool)}")
+
+    if config.use_llm:
+        _run_llm(config, pool, add, progress, warn)
+
+    if not pool:
+        warn(
+            "no candidates — give the target's name and facts "
+            "(--owner/--nick/--keyword/--birthday ...); realistic mode needs a target"
+        )
+
+    ranked = sorted(pool.values(), key=lambda c: (-c.score, _tiebreak(c.value)))
+    if len(ranked) < config.count:
+        warn(
+            f"produced {len(ranked)} unique candidates, fewer than requested {config.count}; "
+            "widen the profile, --years range, or length window for more"
+        )
+    return ranked[: config.count]
+
+
+# --- chaos (absurd) engine --------------------------------------------------
+
+
+def _generate_chaos(
+    config: Config,
+    rng: random.Random,
+    progress: Callable[[str], None],
+    warn: Callable[[str], None],
+) -> list[Candidate]:
+    tokens = config.profile.tokens()
+    seeds = _chaos_seeds(config.profile, config.wordlist)
+    progress(f"seeds: {len(seeds)} ({len(tokens)} from profile)")
+
+    pool: dict[str, Candidate] = {}
+
+    def add(value: str, source: str) -> None:
+        value = value.strip()
+        if not (config.min_len <= len(value) <= config.max_len):
+            return
+        s = absurd.score(value)
+        if source == "llm":
+            s += 1.0
+        cur = pool.get(value)
+        if cur is None or s > cur.score:
+            pool[value] = Candidate(value=value, score=s, source=source)
+
+    def emit(value: str, source: str) -> None:
+        if config.mode == "usernames":
+            for handle in absurd.to_usernames(value, rng):
+                add(handle, source)
+        else:
+            add(value, source)
+
+    absurd_target = max(1, int(config.count * config.absurd_ratio))
+    _fill_absurd(pool, emit, tokens, rng, absurd_target)
+    progress(f"after absurd: {len(pool)}")
+
+    for seed in seeds:
+        for variant in mangle(seed, config.rules, rng):
+            emit(variant, "rule")
+    progress(f"after rules: {len(pool)}")
+
+    if config.use_llm:
+        _run_llm(config, pool, emit, progress, warn)
+
+    _fill_absurd(pool, emit, tokens, rng, config.count)
+    progress(f"after top-up: {len(pool)}")
+
+    ranked = sorted(pool.values(), key=lambda c: (-c.score, _tiebreak(c.value)))
+    if len(ranked) < config.count:
+        warn(f"produced {len(ranked)} unique candidates, fewer than requested {config.count}")
+    return ranked[: config.count]
+
+
+def _fill_absurd(
+    pool: dict[str, Candidate],
+    emit: Callable[[str, str], None],
+    tokens: Sequence[str],
+    rng: random.Random,
+    target: int,
+) -> None:
+    """Emit absurd templates until the pool reaches ``target`` (or tries run out)."""
+    attempts = 0
+    max_attempts = max(target * _TOPUP_FACTOR, 2048)
+    batch = max(256, target // 4)
+    while len(pool) < target and attempts < max_attempts:
+        for value in absurd.absurd_candidates(tokens, rng, batch):
+            emit(value, "absurd")
+        attempts += batch
+
+
+def _chaos_seeds(profile: Profile, wordlist: Sequence[str]) -> list[str]:
     tokens = profile.tokens()
     seeds: list[str] = list(tokens)
-    # Pairwise CamelCase combos of profile tokens — "Bogdan" + "NextJs" style.
     for i, a in enumerate(tokens):
         for b in tokens[i + 1 :]:
-            ca = _camel(a)
-            cb = _camel(b)
+            ca, cb = _camel(a), _camel(b)
             seeds.append(ca + cb)
             seeds.append(cb + ca)
     seeds.extend(wordlist)
@@ -112,135 +258,55 @@ def _camel(word: str) -> str:
     return cleaned[:1].upper() + cleaned[1:] if cleaned else cleaned
 
 
-def generate(
+# --- shared helpers ---------------------------------------------------------
+
+
+def _run_llm(
     config: Config,
-    rng: random.Random,
-    *,
-    progress: Callable[[str], None] | None = None,
-    warn: Callable[[str], None] | None = None,
-) -> list[Candidate]:
-    """Run the full pipeline and return up to ``config.count`` ranked candidates."""
-    _progress = progress or (lambda _m: None)
-    _warn = warn or (lambda _m: None)
+    pool: dict[str, Candidate],
+    add: Callable[[str, str], None],
+    progress: Callable[[str], None],
+    warn: Callable[[str], None],
+) -> None:
+    progress(f"llm: asking {config.llm_backend}:{config.llm_model} for ~{config.llm_count}")
+    desc = _profile_description(config.profile)
+    lines = absurd.llm_lines(
+        desc,
+        backend=config.llm_backend,
+        model=config.llm_model,
+        count=config.llm_count,
+        kind=config.mode,
+        style=config.style,
+        timeout=config.llm_timeout,
+        warn=warn,
+    )
+    for line in lines:
+        add(line, "llm")
+    progress(f"llm: added, pool now {len(pool)}")
 
-    if config.mode not in ("passwords", "usernames"):
-        raise WdGenError(f"unknown mode {config.mode!r}")
-    if config.count < 1:
-        raise WdGenError("count must be >= 1")
 
-    tokens = config.profile.tokens()
-    seeds = _seeds(config.profile, config.wordlist)
-    _progress(f"seeds: {len(seeds)} ({len(tokens)} from profile)")
-
-    pool: dict[str, Candidate] = {}
-
-    def add(value: str, source: str) -> None:
-        value = value.strip()
-        if not (config.min_len <= len(value) <= config.max_len):
-            return
-        s = absurd.score(value)
-        if source == "llm":
-            s += 1.0  # context-aware; nudge it up the ranking
-        existing = pool.get(value)
-        if existing is None or s > existing.score:
-            pool[value] = Candidate(value=value, score=s, source=source)
-
-    def emit(value: str, source: str) -> None:
-        """Add a raw candidate, shaping to a username first when in that mode."""
-        if config.mode == "usernames":
-            for handle in absurd.to_usernames(value, rng):
-                add(handle, source)
-        else:
-            add(value, source)
-
-    # 1. Absurd template gold — generated in volume UP FRONT, not as gap-filler.
-    #    This is the "are we for real bro" material and the whole point of the
-    #    tool, so it must always be present in quantity regardless of how much
-    #    the rule engine produces. Because absurd candidates score highest, this
-    #    is what floats to the top of the capped, ranked output.
-    absurd_target = max(1, int(config.count * config.absurd_ratio))
-    attempts = 0
-    max_attempts = max(absurd_target * _TOPUP_FACTOR, 2048)
-    batch = max(256, absurd_target // 4)
-
-    def absurd_hits() -> int:
-        return sum(1 for c in pool.values() if c.source == "absurd")
-
-    while absurd_hits() < absurd_target and attempts < max_attempts:
-        for value in absurd.absurd_candidates(tokens, rng, batch):
-            emit(value, "absurd")
-        attempts += batch
-    _progress(f"after absurd: {len(pool)} ({absurd_hits()} absurd)")
-
-    # 2. Rule mangling over every seed — breadth/variety for the tail.
-    for seed in seeds:
-        for variant in mangle(seed, config.rules, rng):
-            emit(variant, "rule")
-    _progress(f"after rules: {len(pool)}")
-
-    # 3. Optional local-LLM flavour (best-effort; never blocks the floor).
-    if config.use_llm:
-        _progress(f"llm: asking {config.llm_backend}:{config.llm_model} for ~{config.llm_count}")
-        desc = _profile_description(config.profile)
-        lines = absurd.llm_lines(
-            desc,
-            backend=config.llm_backend,
-            model=config.llm_model,
-            count=config.llm_count,
-            kind=config.mode,
-            timeout=config.llm_timeout,
-            warn=_warn,
-        )
-        for line in lines:
-            emit(line, "llm")
-        _progress(f"llm: added, pool now {len(pool)}")
-
-    # 4. Top up with more absurd templates until we hit the total target.
-    target = config.count
-    attempts = 0
-    max_attempts = target * _TOPUP_FACTOR
-    batch = max(256, target // 4)
-    while len(pool) < target and attempts < max_attempts:
-        for value in absurd.absurd_candidates(tokens, rng, batch):
-            emit(value, "absurd")
-        attempts += batch
-    _progress(f"after top-up: {len(pool)} (target {target})")
-
-    if len(pool) < target:
-        _warn(
-            f"produced {len(pool)} unique candidates, fewer than requested {target}; "
-            "dedup saturated — widen the profile, rules, or length window for more"
-        )
-
-    # Rank by score; scramble within a score tier (deterministically) so the top
-    # of the list is a varied mix, not an alphabetical run of the same template.
-    import hashlib
-
-    def _tiebreak(value: str) -> str:
-        return hashlib.md5(value.encode("utf-8")).hexdigest()  # tiebreak, not security
-
-    ranked = sorted(pool.values(), key=lambda c: (-c.score, _tiebreak(c.value)))
-    return ranked[:target]
+def _tiebreak(value: str) -> str:
+    return hashlib.md5(value.encode("utf-8")).hexdigest()  # tiebreak, not security
 
 
 def _profile_description(profile: Profile) -> str:
     """Human-readable profile summary for the LLM prompt."""
     lines: list[str] = []
     labels = {
-        "names": "owner/people",
-        "org": "organisation",
-        "framework": "framework/stack",
-        "purpose": "purpose",
+        "names": "full name",
+        "org": "employer/organisation",
+        "framework": "tech/interests",
+        "purpose": "context",
         "keywords": "keywords",
         "pets": "pets",
-        "dates": "dates",
-        "extras": "other",
+        "dates": "significant dates",
+        "extras": "other (partner, city, hobbies)",
     }
     for field_name, label in labels.items():
         vals = getattr(profile, field_name)
         if vals:
             lines.append(f"- {label}: {', '.join(vals)}")
-    return "\n".join(lines) if lines else "- (no specific facts provided; go fully generic)"
+    return "\n".join(lines) if lines else "- (no specific facts provided)"
 
 
 def iter_values(candidates: Sequence[Candidate]) -> Iterator[str]:

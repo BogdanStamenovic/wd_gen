@@ -1,8 +1,8 @@
 schema: 1
 name: wd_gen
-description: Generate absurd, memorable passwords and usernames from a target profile
+description: Targeted OSINT/CTF username and password wordlist generator from a target profile
 homepage: https://github.com/BogdanStamenovic/wd_gen
-tags: [cli, password, username, wordlist, python]
+tags: [cli, osint, wordlist, password, ctf, python]
 install:
   platforms: [linux, darwin, windows]
   setup:

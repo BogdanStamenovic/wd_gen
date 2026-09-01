@@ -1,4 +1,4 @@
-"""wd_gen: Generate absurd, memorable passwords and usernames from a target profile"""
+"""wd_gen: Targeted OSINT/CTF username and password wordlist generator from a target profile"""
 
 from __future__ import annotations
 
