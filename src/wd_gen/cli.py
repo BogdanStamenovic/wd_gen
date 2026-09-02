@@ -161,11 +161,14 @@ def _prompt_brief() -> tuple[str, str]:
     Prompts go to stderr so stdout stays wordlist-only. Context ends on a blank
     line or EOF (Ctrl-D).
     """
-    print("wd_gen: describe the target like you're writing a short email.", file=sys.stderr)
-    print("purpose (what the credential is, e.g. 'office wifi password'):", file=sys.stderr)
+    print("wd_gen: describe the target like a short email — type your answers below.",
+          file=sys.stderr)
+    print("  (the LLM planner runs after you finish; nothing hits the server until then)",
+          file=sys.stderr)
+    print("\npurpose — what the credential is (e.g. 'office wifi password'):", file=sys.stderr)
     print("> ", end="", file=sys.stderr, flush=True)
     purpose = (sys.stdin.readline() or "").strip()
-    print("context (who/where/facts; end with a blank line or Ctrl-D):", file=sys.stderr)
+    print("context — who/where/any facts. Finish with an empty line (or Ctrl-D):", file=sys.stderr)
     print("> ", end="", file=sys.stderr, flush=True)
     lines: list[str] = []
     for line in sys.stdin:
@@ -281,6 +284,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.plan:
                 plan = _load_plan(args.plan)
             elif args.llm or want_interactive or brief:
+                if args.llm_backend == "ollama":
+                    log(f"wd_gen: planning with {args.llm_model} @ {args.llm_host} "
+                        "(the first call loads the model on the server; can take 10-30s)…")
                 plan = planner.llm_plan(
                     profile, purpose, brief, mode=mode,
                     backend=args.llm_backend, model=args.llm_model, host=args.llm_host,
